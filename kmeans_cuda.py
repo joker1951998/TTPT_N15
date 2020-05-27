@@ -41,6 +41,7 @@ def preprocess(s, lowercase=True):
     return tokens
 
 
+#terms kthuoc: N * 16
 mo = """
 
 __device__ float distE(int i,int j,int size, float * terms){
@@ -52,75 +53,73 @@ __device__ float distE(int i,int j,int size, float * terms){
 }
 
 
-__global__ void kmeans(int * id, float * terms, int * centroids,int * new_centroids, float * centroids_terms, int * cluster, float dist[%(N)s][%(K)s]){
-    unsigned int Bx = blockIdx.x;
-    unsigned int By = blockIdx.y;
-    unsigned int Tx = threadIdx.x;
-    unsigned int Ty = threadIdx.y;
-    unsigned int BSx = blockDim.x;
-    unsigned int BSy = blockDim.y;
-    unsigned int GSx = gridDim.x;
-    unsigned int GSy = gridDim.y;
-    int i = Tx + Bx*BSx ;
-    int j = Ty + By*BSy ;
-    int r = blockIdx.x * blockDim.x + threadIdx.x;
-    int c = blockIdx.y * blockDim.y + threadIdx.y;  
+__global__ void kmeans(int * id, float * terms, int * centroids,int * new_centroids, float * centroids_terms, int * cluster, float *dist){
+    //dist[%(N)s][%(K)s]
+    
+    int col = blockIdx.x*blockDim.x+threadIdx.x;
+    int row = blockIdx.y*blockDim.y+threadIdx.y;
+    //gridDimx = 10, gridDimy = 1024
+    int index = col* blockDim.y * gridDim.y + row;  
+    
+    if(index < %(size)s){
 
-    dist[c][r] = distE(r,centroids[0],16,terms);
-    // dist[ r * %(K)s + c] = 1;
-    __syncthreads();
-    if(Bx ==0 && Tx==0){
-        float min_centroid = dist[c][0];
-        float min_index = 0;
-
-        for (int m = 0; m < %(K)s; m++){
-            if (dist[c][m] < min_centroid){
-                min_centroid = dist[c][m];
-                min_index = m;
-
-            }
-        }
-        cluster[r*%(K)s + c] = min_index;
-    }
-
-
+        dist[index] = distE(row,centroids[gridDim.x],16,terms);
+    } 
+    
 }
 
-__global__ void recompute_clusters(int * id, float * terms, int * centroids,int * new_centroids, float * centroids_terms, int * cluster, float * dist){
-    unsigned int i = blockIdx.x;
-    unsigned int j = threadIdx.x;
+__global__ void compute_clusters(int *cluster, float dist[%(N)s][%(K)s]){
+    float min_centroid = 9999999999999999.0;
+    int min_index = 0;
+    int index;
 
-    if(cluster[j] == i){
-        new_centroids[i*blockDim.x +j] = 1;
+    for (int m = 0; m < %(K)s; m++){
+        
+        int c = blockIdx.x*blockDim.x+threadIdx.x;
+        int r = blockIdx.y*blockDim.y+threadIdx.y;
+        index = c* blockDim.y * gridDim.y + r;  
+        
+        if (dist[index][m] < min_centroid && index < %(size)s ){
+            min_centroid = dist[index][m];
+            
+            min_index = m;
 
-    }
-    __syncthreads();
-
-    if(j ==0){
-        for(int t =0;t<blockDim.x;t++){
-            if(new_centroids[i*blockDim.x +t] ==1){
-                centroids[i] = t; 
-                break;
-            }
         }
+    }
+        
+    cluster[index] = min_index;
+    
+    
+}
 
+__global__ void recompute_centroids(int * id, float * terms, int * centroids,int *new_centroids, float * centroids_terms, int * cluster, float * dist){
+    
+
+    int c = blockIdx.x*blockDim.x+threadIdx.x;
+    int r = blockIdx.y*blockDim.y+threadIdx.y;
+    int index = c* blockDim.y * gridDim.y + r; 
+    
+    for (int i =0; i< 10;i++){
+        if(cluster[index] == i && index < centroids[i] && index < %(size)s){
+            centroids[i] = index;
+        }
     }
 
 }
 __global__ void reset_values(int *new_centroids){
-    unsigned int i = threadIdx.x;
-    unsigned int j = blockIdx.x;
-    unsigned int size = blockDim.x;
+    int c = blockIdx.x*blockDim.x+threadIdx.x;
+    int r = blockIdx.y*blockDim.y+threadIdx.y;
+    int index = c* blockDim.y * gridDim.y + r;
 
-    new_centroids[j*size +i] = 0;
+    new_centroids[index] = 0;
 }
 """
 
 
 def kmeans_iter(id, terms, centroids, new_centroids, centroids_terms, cluster, dist):
     kmean_cuda(id, terms, centroids, new_centroids, centroids_terms, cluster, dist, block=(32, 32, 1), grid=(10, 1024))
-    recompute_clusters(id, terms, centroids, new_centroids, centroids_terms, cluster, dist, block=(32, 32, 1),
-                       grid=(10, 1024))
+    compute_cluters(cluster,dist,block=(32, 32, 1), grid=(32,32))
+    recompute_centroids(id, terms, centroids, new_centroids, centroids_terms, cluster, dist, block=(32, 32, 1),grid=(32,32))
     reset(new_centroids, block=(32, 32, 1), grid=(10, 1024))
 
 
@@ -225,7 +224,7 @@ def printResult(clusters, centroids, id, K):
     final = []
     for i in range(K):
         x = []
-        for j, u in enumerate(list_clusters):
+        for j, u in enumerate(list_clusters[:1048575]):
             if u == i:
                 x.append(id[j])
         final.append(x)
@@ -236,22 +235,31 @@ def printResult(clusters, centroids, id, K):
 start = time.time()
 terms, id, cen = load()
 
-N = len(id)
-K = len(cen)
+N = 1048576
+K = int(len(cen))
 
 kernel_code = mo % {
     'N': N,
-    'K': K
+    'K': K,
+    'size': int(len(id))
 }
 mod = SourceModule(kernel_code)
 
 kmean_cuda = mod.get_function("kmeans")
-recompute_clusters = mod.get_function('recompute_clusters')
+recompute_centroids = mod.get_function('recompute_centroids')
 reset = mod.get_function('reset_values')
-centroids, dist, cluster = kmean_pycuda(id, terms, cen, N, K)
+compute_cluters = mod.get_function("compute_clusters")
 
+print('before centroids')
+print(cen)
+centroids, dist, cluster = kmean_pycuda(id, terms, cen, N, K)
+print("cluster")
+print(cluster.get())
+
+print('after centroids')
+print(centroids.get())
 end = time.time()
-printResult(cluster, centroids, id, K)
-print( 'total run-time: %f ms' % ((end - start) * 1000))
+# printResult(cluster, centroids, id, K)
+print( 'total run-time: %f s' % ((end - start)))
 
 
